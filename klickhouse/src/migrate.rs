@@ -179,6 +179,7 @@ pub struct ClusterMigration {
     client: Client,
     cluster_name: String,
     database: String,
+    do_lock: bool,
 }
 
 impl ClusterMigration {
@@ -187,7 +188,13 @@ impl ClusterMigration {
             client,
             cluster_name,
             database,
+            do_lock: true,
         }
+    }
+
+    pub fn without_lock(mut self) -> Self {
+        self.do_lock = false;
+        self
     }
 }
 
@@ -201,15 +208,19 @@ impl AsyncTransaction for ClusterMigration {
         let lock = ClickhouseLock::new(self.client.clone(), "refinery_exec")
             .with_cluster(&self.cluster_name);
         let start = Instant::now();
-        let handle = loop {
-            if let Some(handle) = lock.try_lock().await? {
-                break handle;
-            } else {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                if start.elapsed() > Duration::from_secs(60) {
-                    lock.reset().await?;
+        let handle = if self.do_lock {
+            Some(loop {
+                if let Some(handle) = lock.try_lock().await? {
+                    break handle;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    if start.elapsed() > Duration::from_secs(60) {
+                        lock.reset().await?;
+                    }
                 }
-            }
+            })
+        } else {
+            None
         };
         let mut n = 0;
         for query in queries {
@@ -224,7 +235,9 @@ impl AsyncTransaction for ClusterMigration {
                 Client::execute(&self.client, query).await?;
             }
         }
-        handle.unlock().await?;
+        if let Some(handle) = handle {
+            handle.unlock().await?;
+        }
         Ok(n)
     }
 }
